@@ -1,0 +1,2 @@
+,mean,std,median,5.0%,95.0%,n_eff,r_hat
+mu_1,tensor(-0.0087),tensor(0.0130),tensor(-0.0081),tensor(-0.0302),tensor(0.0105),tensor(168.7664),tensor(1.0083)
