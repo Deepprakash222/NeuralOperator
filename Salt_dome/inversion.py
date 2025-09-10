@@ -276,7 +276,7 @@ def main():
     dot = pyro.render_model(pyro_model, model_args=(test_list, num_layers, model, Interpolation_matrix,  u_shift, phi_r, obs_data , device),render_distributions=True)
     pyro.set_rng_seed(42)
 
-    prior = Predictive(pyro_model,num_samples=10000)(test_list, num_layers, model, Interpolation_matrix,   u_shift, phi_r, obs_data , device)
+    prior = Predictive(pyro_model,num_samples=500)(test_list, num_layers, model, Interpolation_matrix,   u_shift, phi_r, obs_data , device)
     #plt.figure(figsize=(8,10))
     data = az.from_pyro(prior=prior)
     #az.plot_trace(data.prior)
@@ -322,7 +322,6 @@ def main():
         az.plot_density(
         data=[data.posterior, data.prior],
         shade=.9,
-        bw=0.003,  # increase bandwidth for smoother curve
         var_names=['mu_' +str(i+1)],
         data_labels=["Posterior Predictive", "Prior Predictive"],
         )
