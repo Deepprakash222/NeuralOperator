@@ -286,7 +286,7 @@ def main():
     ################################################################################
     pyro.primitives.enable_validation(is_validate=True)
     nuts_kernel = NUTS(pyro_model, step_size=0.0085, adapt_step_size=True, target_accept_prob=0.9, max_tree_depth=10, init_strategy=init_to_mean)
-    mcmc = MCMC(nuts_kernel, num_samples=100, mp_context="spawn", warmup_steps=100,num_chains=5, disable_validation=True)
+    mcmc = MCMC(nuts_kernel, num_samples=100, mp_context="fork", warmup_steps=100,num_chains=5, disable_validation=True)
     mcmc.run(test_list, num_layers, model,Interpolation_matrix,  u_shift, phi_r, obs_data , device)
     posterior_samples = mcmc.get_samples(group_by_chain=False)
     samples = mcmc.get_samples(group_by_chain=True)
