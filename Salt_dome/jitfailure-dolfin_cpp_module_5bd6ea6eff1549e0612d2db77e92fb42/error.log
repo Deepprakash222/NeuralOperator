@@ -1,0 +1,5 @@
+In file included from /home/ld379184/anaconda3/envs/gempy_dino/include/dolfin/la/PETScVector.h:37,
+                 from /tmp/ld379184/login23-4_26332/tmpu7zg2c4a/dolfin_cpp_module_5bd6ea6eff1549e0612d2db77e92fb42.cpp:18:
+/home/ld379184/anaconda3/envs/gempy_dino/include/petscsys.h:94:6: error: #error "PETSc was configured with MPICH but now appears to be compiling using a non-MPICH mpi.h"
+   94 |     #error "PETSc was configured with MPICH but now appears to be compiling using a non-MPICH mpi.h"
+      |      ^~~~~
