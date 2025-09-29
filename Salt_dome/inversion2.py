@@ -313,7 +313,7 @@ def main():
     posterior_predictive = Predictive(pyro_model, posterior_samples)(test_list, num_layers, model, Interpolation_matrix,  u_shift, phi_r, obs_data , device)
     plt.figure(figsize=(8,10))
     data = az.from_pyro(posterior=mcmc, prior=prior, posterior_predictive=posterior_predictive)
-    az.plot_trace(data)
+    az.plot_trace(data) #####
     ###############################################TODO################################
     # Plot and save the file for each parameter
     ###################################################################################

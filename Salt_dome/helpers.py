@@ -24,7 +24,7 @@ def create_initial_gempy_model(refinement, filename='prior_model.png', save=True
     )
    
     brk1 = 0.3
-    brk2 = 0.22
+    brk2 = 0.22 # random variable
     brk3 = 0.2
     grad = 1.0
     gp.add_surface_points(
