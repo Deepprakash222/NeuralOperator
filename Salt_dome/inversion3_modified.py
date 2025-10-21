@@ -1,82 +1,108 @@
-# inversion3.py — SVI version (device-safe, plots, tidy CSV, final model)
-
-# (optional) lock to a single GPU to silence fork_rng warnings:
-# import os as _os; _os.environ["CUDA_VISIBLE_DEVICES"] = "0"
-
-import os
 import json
-import numpy as np
-import torch
 import ufl
 import dolfin as dl
-import arviz as az
-import matplotlib.pyplot as plt
 from datetime import datetime
-
 import hippylib as hp
 import hippyflow as hf
 
 from helpers import *
 from generate_samples import *
-from train_nn import *
-
+from train_nn import *  # your NeuralNet lives here
+import arviz as az
+from pyro.infer import Predictive
+from pyro.infer.autoguide import init_to_mean
 import pandas as pd
+import torch
 import pyro
-from pyro import render_model, clear_param_store, primitives
 import pyro.distributions as dist
-from pyro.infer import Predictive, SVI, Trace_ELBO
-from pyro.optim import ClippedAdam
-from pyro.infer.autoguide import AutoNormal
+import numpy as np
+import matplotlib.pyplot as plt
+import sys
+from torch.serialization import add_safe_globals, safe_globals
+
+# -----------------------------------------------------------------------------
+# Make checkpoints saved as "train_nn2.NeuralNet" resolvable + allowlisted
+# -----------------------------------------------------------------------------
+import train_nn as train_nn2
+sys.modules['train_nn2'] = train_nn2
+from train_nn2 import NeuralNet
+add_safe_globals([NeuralNet])  # allowlist for weights_only=True in PyTorch 2.6
 
 
-# ---------------------------
-# Pyro model (device-aware)
-# ---------------------------
+# -----------------------------------------------------------------------------
+# Pyro model (SVI-compatible). NOTE: no torch.no_grad() here (we need gradients).
+# -----------------------------------------------------------------------------
 def pyro_model(interpolation_input_, num_layers, NN_model, Interpolation_matrix, u_shift, phi, obs_data, device):
     """
-    Priors over mu_i, NN->field->interpolate, Gaussian likelihood with learned sigma.
+    Probabilistic geological model in Pyro.
+    Defines priors for top-layer locations and observed thickness.
     """
-    params = []
+    parameter = []
     counter = 1
-    for d in interpolation_input_[:num_layers]:
-        if d["update"] != "interface_data":
-            counter += 1
-            continue
-
-        if d["prior_distribution"] == "normal":
-            mean_t = d["normal"]["mean"]
-            std_t  = d["normal"]["std"]
-            mean_t = mean_t.to(device) if isinstance(mean_t, torch.Tensor) else torch.tensor(mean_t, device=device)
-            std_t  = std_t.to(device)  if isinstance(std_t, torch.Tensor)  else torch.tensor(std_t, device=device)
-            params.append(pyro.sample(f"mu_{counter}", dist.Normal(mean_t, std_t)))
-        elif d["prior_distribution"] == "uniform":
-            mn = d["uniform"]["min"]
-            mx = d["uniform"]["max"]
-            mn = mn.to(device) if isinstance(mn, torch.Tensor) else torch.tensor(mn, device=device)
-            mx = mx.to(device) if isinstance(mx, torch.Tensor) else torch.tensor(mx, device=device)
-            params.append(pyro.sample(f"mu_{counter}", dist.Uniform(mn, mx)))
-        else:
-            raise ValueError("Unsupported prior_distribution")
+    for interpolation_input_data in interpolation_input_[:num_layers]:
+        if interpolation_input_data["update"] == "interface_data":
+            if interpolation_input_data["prior_distribution"] == "normal":
+                mean = interpolation_input_data["normal"]["mean"]
+                std = interpolation_input_data["normal"]["std"]
+                rv = pyro.sample(f"mu_{counter}", dist.Normal(mean, std))
+                parameter.append(rv.to(device))
+            elif interpolation_input_data["prior_distribution"] == "uniform":
+                min_ = interpolation_input_data["uniform"]["min"]
+                max_ = interpolation_input_data["uniform"]["max"]
+                rv = pyro.sample(f"mu_{counter}", dist.Uniform(min_, max_))
+                parameter.append(rv.to(device))
+            else:
+                raise ValueError("Unsupported prior_distribution; use 'normal' or 'uniform'.")
         counter += 1
 
-    input_data = torch.stack(params).to(device) if params else torch.empty((0,), dtype=torch.float32, device=device)
+    # Stack list of 0-D tensors into shape [num_layers] (keeps grad wrt latents)
+    input_data = torch.stack(parameter).to(device)
 
-    # keep grads (no torch.no_grad)
-    NN_output = NN_model(input_data)                  # CHANGED: allow grad
+    NN_model.eval()  # freeze weights, but keep autograd through inputs
+    NN_output = NN_model(input_data)  # if your NN expects [B,F], use .unsqueeze(0)/.squeeze(0)
+
+    # Project to observation space
     output = torch.matmul(Interpolation_matrix, torch.matmul(NN_output, phi.T) + u_shift)
 
-    # CHANGED: device-aware sigma prior
-    sigma = pyro.sample("sigma", dist.HalfCauchy(torch.tensor(0.1, device=device)))
+    # Likelihood (do NOT .to(...) the return of pyro.sample when obs=... )
+    with pyro.plate("likelihood", obs_data.shape[0]):
+        pyro.sample("obs", dist.Normal(output, 0.05), obs=obs_data)
 
-    with pyro.plate("obs_plate", obs_data.shape[0]):
-        pyro.sample("obs", dist.Normal(output, sigma), obs=obs_data)
+
+# -----------------------------------------------------------------------------
+# Optional: robust helper for ArviZ conversion
+# -----------------------------------------------------------------------------
+def to_arviz_safe(posterior_samples, prior, posterior_predictive):
+    try:
+        return az.from_pyro(
+            posterior=posterior_samples,
+            prior=prior,
+            posterior_predictive=posterior_predictive
+        )
+    except Exception:
+        post_np = {k: v.detach().cpu().numpy() for k, v in posterior_samples.items()}
+        prior_np = {}
+        if isinstance(prior, dict):
+            for k, v in prior.items():
+                if isinstance(v, torch.Tensor) and k.startswith("mu_"):
+                    prior_np[k] = v.detach().cpu().numpy()
+        ppc_np = {}
+        if isinstance(posterior_predictive, dict) and "obs" in posterior_predictive:
+            ppc_np["obs"] = posterior_predictive["obs"].detach().cpu().numpy()
+        return az.from_dict(
+            posterior=post_np,
+            prior=prior_np if prior_np else None,
+            posterior_predictive=ppc_np if ppc_np else None
+        )
 
 
 def main():
-    # ---------- device ----------
+    # -------------------------------------------------------------------------
+    # Device
+    # -------------------------------------------------------------------------
     if torch.backends.mps.is_available() and torch.backends.mps.is_built():
-        device = torch.device("cpu")
-        print("MPS available — using CPU for stability")
+        device = torch.device("cpu")  # Fenics + MPS can be problematic
+        print("Using MPS device (forcing CPU for compatibility)")
     elif torch.cuda.is_available():
         device = torch.device("cuda")
         print("Using CUDA device")
@@ -84,8 +110,11 @@ def main():
         device = torch.device("cpu")
         print("Using CPU device")
 
-    # ---------- FEM / PDE setup ----------
-    nx = 31; ny = 31
+    # -------------------------------------------------------------------------
+    # FEniCS / PDE setup
+    # -------------------------------------------------------------------------
+    nx = 31
+    ny = 31
     nodes = (nx + 1) * (ny + 1)
     mesh = dl.RectangleMesh(dl.Point(0.0, 0.0), dl.Point(1.0, 1.0), nx, ny)
     Vh_STATE = dl.FunctionSpace(mesh, "CG", 2)
@@ -103,203 +132,187 @@ def main():
     bc0 = dl.DirichletBC(Vh[hp.STATE], u_bdr0, u_boundary)
     f = dl.Constant(0.0)
 
-    def pde_varf(u,m,p):
-        return m*ufl.inner(ufl.grad(u), ufl.grad(p))*ufl.dx - f*p*ufl.dx
+    def pde_varf(u, m, p):
+        return m * ufl.inner(ufl.grad(u), ufl.grad(p)) * ufl.dx - f * p * ufl.dx
 
     pde = hp.PDEVariationalProblem(Vh, pde_varf, bc, bc0, is_fwd_linear=True)
 
-    # ---------- observation locations ----------
-    xs = [0.1,0.2,0.3,0.4,0.5,0.6,0.7,0.8,0.9]
-    Borehole_extent = [0.1]*len(xs)
-    Borehole_points = [20]*len(xs)
-    tgt = []
-    for i,x in enumerate(xs):
-        z = np.linspace(Borehole_extent[i], 0.9, Borehole_points[i])
-        tgt.append(np.column_stack((np.full_like(z, x), z)))
-    targets = np.vstack(tgt)
+    # Observation operator (boreholes)
+    Borehole_location = [0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9]
+    Borehole_extent = [0.1] * 9
+    Borehole_points = [20] * 9
+    target_list = []
+    for i, x in enumerate(Borehole_location):
+        z_data = np.linspace(Borehole_extent[i], 0.9, Borehole_points[i])
+        first_column = np.full((z_data.shape[0],), x)
+        two_d_array = np.column_stack((first_column, z_data))
+        target_list.append(two_d_array)
+    targets = np.vstack(target_list)
     B = hp.assemblePointwiseObservation(Vh[hp.STATE], targets)
 
-    # ---------- truth + noisy obs ----------
-    u = dl.Function(Vh[hp.STATE]); uadj = dl.Function(Vh[hp.ADJOINT])
-    m = dl.Function(Vh[hp.PARAMETER])
-
+    # True parameter field & state
     m_initial, sp_coords_copy_test, gempy_model = create_true_data(mesh=mesh, nodes=nodes, filename=None)
     m_initial = 2 * m_initial
+    m = dl.Function(Vh[hp.PARAMETER])
     m.vector().set_local(m_initial[d2v])
 
+    # Quick visualization of parameter (optional)
+    fig, ax = plt.subplots(figsize=(6, 6))
+    im = plt.imshow(m_initial.reshape((nx + 1, nx + 1)), cmap='viridis', origin='lower',
+                    interpolation='bilinear', extent=[0, 1, 0, 1])
+    fig.colorbar(im, ax=ax)
+    ax.set_xlabel("x-coordinate")
+    ax.set_ylabel("z-coordinate")
+    ax.set_title("Parameter Field $m(x,z)$")
+    plt.tight_layout()
+    plt.show()
+
+    u = dl.Function(Vh[hp.STATE])
+    uadj = dl.Function(Vh[hp.ADJOINT])
     x = [u.vector(), m.vector(), uadj.vector()]
     pde.solveFwd(x[hp.STATE], x)
+    u_true = x[hp.STATE].get_local()
+    u_obs = B.array() @ u_true
 
-    observable_2 = hf.LinearStateObservable(pde, B)
-    u_obs = observable_2.evalu(x[hp.STATE]).get_local()  # numpy
+    # Add Gaussian noise to observations
+    u_obs = u_obs + np.random.normal(loc=0.0, scale=0.05, size=u_obs.shape)
 
-    # ---------- reduced-order + NN ----------
+    # -------------------------------------------------------------------------
+    # Load reduced-order items + NN model
+    # -------------------------------------------------------------------------
     dtype = torch.float32
-    Mphi_r = torch.tensor(np.load('./saved_model/Mphi_r.npy'), dtype=dtype, device=device)
-    phi_r   = torch.tensor(np.load('./saved_model/phi_r.npy'), dtype=dtype, device=device)
+    Mphi_r = torch.tensor(np.load('./saved_model/Mphi_r.npy'), dtype=dtype, device=device)  # (loaded but unused)
+    phi_r = torch.tensor(np.load('./saved_model/phi_r.npy'), dtype=dtype, device=device)
     u_shift = torch.tensor(np.load('./saved_model/u_shift.npy'), dtype=dtype, device=device)
 
-    # load & MOVE model to device
-    model_jacobian_full = torch.load("./saved_model/model_jacobian_full.pth", map_location=device, weights_only=False)
-    model_jacobian_full.to(device)                    # CHANGED
-    model_jacobian_full.eval()
+    # Robust checkpoint load (PyTorch 2.6)
+    ckpt_path = "./saved_model/model_jacobian_full.pth"
+    try:
+        # Safe load with weights_only=True (default) and allowlisted class
+        with safe_globals([NeuralNet]):
+            obj = torch.load(ckpt_path, map_location=device)  # weights_only=True by default in 2.6
+    except Exception as e:
+        print("[warn] Safe load failed; falling back to weights_only=False (trusted checkpoint):", repr(e))
+        # Use this ONLY if you trust the checkpoint file (your own artifact)
+        obj = torch.load(ckpt_path, map_location=device, weights_only=False)
 
-    # ---------- priors ----------
-    test_list=[]
+    # Normalize to ready-to-use model
+    if isinstance(obj, dict) and all(isinstance(v, torch.Tensor) for v in obj.values()):
+        # pure state_dict
+        model_jacobian_full = NeuralNet().to(device)  # <-- supply ctor args if your model needs them
+        model_jacobian_full.load_state_dict(obj)
+        model_jacobian_full.eval()
+    elif isinstance(obj, dict) and "state_dict" in obj:
+        model_jacobian_full = NeuralNet().to(device)  # <-- ctor args if needed
+        model_jacobian_full.load_state_dict(obj["state_dict"])
+        model_jacobian_full.eval()
+    else:
+        # full nn.Module
+        model_jacobian_full = obj.to(device)
+        model_jacobian_full.eval()
+
+    # -------------------------------------------------------------------------
+    # Priors over interface(s)
+    # -------------------------------------------------------------------------
     std = 0.03
-    test_list.append({
-        "update":"interface_data","id":torch.tensor([1]),
-        "direction":"Z",
-        "prior_distribution":"normal",
-        "normal":{
-            "mean": torch.tensor(sp_coords_copy_test[1,2], dtype=dtype, device=device),
-            "std":  torch.tensor(std, dtype=dtype, device=device)
+    test_list = [{
+        "update": "interface_data",
+        "id": torch.tensor([1]),
+        "direction": "Z",
+        "prior_distribution": "normal",
+        "normal": {
+            "mean": torch.tensor(sp_coords_copy_test[1, 2], dtype=dtype, device=device),
+            "std": torch.tensor(std, dtype=dtype, device=device)
         }
-    })
-
+    }]
     num_layers = len(test_list)
-    model = model_jacobian_full
+
     Interpolation_matrix = torch.tensor(B.array(), dtype=dtype, device=device)
-    obs_data = torch.tensor(u_obs, dtype=dtype, device=device)   # CHANGED: device tensor
+    obs_data = torch.tensor(u_obs, dtype=dtype, device=device)
+    model = model_jacobian_full
 
-    # (optional) render
-    try:
-        render_model(
-            pyro_model,
-            model_args=(test_list, num_layers, model, Interpolation_matrix, u_shift, phi_r, obs_data, device),
-            render_distributions=True
-        )
-    except Exception as e:
-        print("[note] render_model skipped:", e)
-
+    # -------------------------------------------------------------------------
+    # Prior predictive (latents)
+    # -------------------------------------------------------------------------
     pyro.set_rng_seed(42)
+    prior = Predictive(pyro_model, num_samples=1000)(
+        test_list, num_layers, model, Interpolation_matrix, u_shift, phi_r, obs_data, device
+    )
 
-    # ---------- SVI inference ----------
-    clear_param_store()
-    primitives.enable_validation(is_validate=True)
-    guide = AutoNormal(pyro_model)
-    optim = ClippedAdam({"lr": 1e-3})
-    svi = SVI(pyro_model, guide, optim, loss=Trace_ELBO())
+    # -------------------------------------------------------------------------
+    # Posterior via SVI
+    # -------------------------------------------------------------------------
+    from pyro.infer import SVI, Trace_ELBO
+    from pyro.infer.autoguide import AutoDiagonalNormal
+    from pyro.optim import ClippedAdam
 
-    steps = int(os.getenv("SVI_STEPS", 3000))
-    log_every = max(1, steps // 50)
-    print("Running SVI...")
-    t0 = datetime.now()
-    for s in range(1, steps+1):
+    guide = AutoDiagonalNormal(pyro_model, init_loc_fn=init_to_mean)
+    svi = SVI(pyro_model, guide, ClippedAdam({"lr": 3e-3, "clip_norm": 5.0}), loss=Trace_ELBO())
+
+    pyro.clear_param_store()
+    num_steps = 4000
+    for step in range(num_steps):
         loss = svi.step(test_list, num_layers, model, Interpolation_matrix, u_shift, phi_r, obs_data, device)
-        if s % log_every == 0 or s == 1:
-            print(f"[SVI] step {s:5d}/{steps} | ELBO: {loss:.3f}")
-    print(f"[SVI] finished in {(datetime.now()-t0).total_seconds():.2f}s")
+        if (step + 1) % 500 == 0:
+            print(f"[SVI] step {step + 1}/{num_steps}, loss = {loss:.4f}")
 
-    # ---------- posterior draws ----------
-    draws = int(os.getenv("SVI_SAMPLES", 1000))
-    predictive = Predictive(pyro_model, guide=guide, num_samples=draws, return_sites=None)
-    with torch.no_grad():
-        post = predictive(test_list, num_layers, model, Interpolation_matrix, u_shift, phi_r, obs_data, device)
+    # Draw samples from the variational posterior
+    num_posterior_samples = 2000
+    posterior_samples = Predictive(guide, num_samples=num_posterior_samples)(
+        test_list, num_layers, model, Interpolation_matrix, u_shift, phi_r, obs_data, device
+    )
+    # Keep only latent mu_* sites
+    posterior_samples = {k: v for k, v in posterior_samples.items() if k.startswith("mu_")}
 
-    names = [k for k in post if k.startswith("mu_")] + (["sigma"] if "sigma" in post else [])
+    # Summaries
+    summary_stats = {k: {"mean": torch.mean(v).item(), "std": torch.std(v).item()} for k, v in posterior_samples.items()}
+    pd.DataFrame(summary_stats).T.to_csv("pyro_summary.csv")
 
-    # summarize mu_* (for final models)
-    mu_names = sorted([n for n in post if n.startswith("mu_")], key=lambda x: int(x.split("_")[-1]))
-    list_parameter_mean, list_parameter_mean_plus_std, list_parameter_mean_minus_std = [], [], []
-    summary_stats = {}
-
-    for i, name in enumerate(mu_names):
-        vals = post[name].reshape(post[name].shape[0], -1)   # (draws, ...)
-        m = vals.mean(0).mean()
-        s = vals.std(0, unbiased=True).mean()
+    list_parameter_mean = []
+    list_parameter_mean_plus_std = []
+    list_parameter_mean_minus_std = []
+    for i in range(len(test_list)):
+        name = f"mu_{i + 1}"
+        vals = posterior_samples[name]
+        mean_val = torch.mean(vals)
+        std_val = torch.std(vals)
         print("Prior mean:", test_list[i]["normal"]["mean"], "Prior std:", test_list[i]["normal"]["std"])
-        print("Posterior mean:", m, "Posterior std:", s)
-        summary_stats[f"{name}_mean"] = float(m)
-        summary_stats[f"{name}_std"]  = float(s)
-        list_parameter_mean.append(float(m))
-        list_parameter_mean_plus_std.append(float(m + s))
-        list_parameter_mean_minus_std.append(float(m - s))
+        print("Posterior mean (SVI):", mean_val, "Posterior std (SVI):", std_val)
+        list_parameter_mean.append(mean_val.to(torch.float64))
+        list_parameter_mean_plus_std.append((mean_val + std_val).to(torch.float64))
+        list_parameter_mean_minus_std.append((mean_val - std_val).to(torch.float64))
 
-    if "sigma" in post:
-        svals = post["sigma"].reshape(post["sigma"].shape[0], -1)
-        summary_stats["sigma_mean"] = float(svals.mean())
-        summary_stats["sigma_std"]  = float(svals.std())
+    # Posterior predictive
+    posterior_predictive = Predictive(pyro_model, guide=guide, num_samples=1000)(
+        test_list, num_layers, model, Interpolation_matrix, u_shift, phi_r, obs_data, device
+    )
 
-    summary_stats["obs_count"] = int(targets.shape[0])
-    uniq = np.unique(targets[:, [0, 1]], axis=0)
-    stride = max(1, len(uniq)//20)
-    summary_stats["obs_coords"] = ";".join(f"({x:.2f},{z:.2f})" for x,z in uniq[::stride])
-    summary_stats["elbo_final"] = float(loss)
-    pd.DataFrame.from_dict(summary_stats, orient="index").to_csv("pyro_summary.csv")
+    # ArviZ conversion & plots (robust)
+    data = to_arviz_safe(posterior_samples, prior, posterior_predictive)
+    az.plot_trace(data)
 
-    # tidy CSV of posterior draws (one row per draw)
-    tidy_rows = []
-    for d in range(draws):
-        row = {"draw": d}
-        for name in names:
-            arr = post[name][d].detach().cpu().numpy().ravel()
-            row[name] = float(arr.item()) if arr.size == 1 else json.dumps(arr.tolist())
-        tidy_rows.append(row)
-    pd.DataFrame(tidy_rows).to_csv("pyro_summary_tidy.csv", index=False)
-    print(f"Wrote {len(tidy_rows)} posterior rows to pyro_summary_tidy.csv (header written=True)")
-
-    # ---------- ArviZ trace ----------
-    try:
-        az_posterior = {}
-        for name in names:
-            arr = post[name].detach().cpu().numpy()  # (draws, ...)
-            if arr.ndim == 1:
-                arr = arr[None, :]                  # (1, draws)
-            else:
-                arr = arr[None, ...]                # (1, draws, ...)
-            az_posterior[name] = arr
-        az_data = az.from_dict(posterior=az_posterior)
-        os.makedirs("./saved_model", exist_ok=True)
-        plt.figure(figsize=(8,10))
-        az.plot_trace(az_data, var_names=list(az_posterior.keys()))
-        plt.savefig("./saved_model/svi_trace.png", bbox_inches="tight")
+    for i in range(len(test_list)):
+        plt.figure(figsize=(8, 10))
+        az.plot_density(
+            data=[data.posterior, data.prior],
+            shade=0.9,
+            bw=0.003,
+            var_names=[f"mu_{i + 1}"],
+            data_labels=["Posterior (SVI)", "Prior"]
+        )
+        plt.savefig(f"./saved_model/mu_{i}.png")
         plt.close()
-    except Exception as e:
-        print("ArviZ plotting skipped:", e)
 
-    # density plots
-    try:
-        os.makedirs("./saved_model", exist_ok=True)
-        for name in names:
-            plt.figure(figsize=(6,6))
-            data_dict = {name: post[name].detach().cpu().numpy()}
-            az.plot_density(data=[data_dict], var_names=[name], shade=0.9)
-            plt.title(name)
-            plt.savefig(f"./saved_model/{name}.png", bbox_inches="tight")
-            plt.close()
-    except Exception as e:
-        print("Density plots skipped:", e)
-
-    # ---------- build final GemPy models ----------
-    try:
-        # CHANGED: pass CPU tensors of floats to helper
-        posterior_mean_t  = torch.tensor(list_parameter_mean, dtype=torch.float32, device="cpu")
-        posterior_plus_t  = torch.tensor(list_parameter_mean_plus_std, dtype=torch.float32, device="cpu")
-        posterior_minus_t = torch.tensor(list_parameter_mean_minus_std, dtype=torch.float32, device="cpu")
-
-        generate_final_model(
-            geo_model=gempy_model, interpolation_input_=test_list, num_layers=num_layers,
-            posterior_data=posterior_mean_t, slope=200, filename='posterior_model.png'
-        )
-        generate_final_model(
-            geo_model=gempy_model, interpolation_input_=test_list, num_layers=num_layers,
-            posterior_data=posterior_plus_t, slope=200, filename='posterior_model_plus_std.png'
-        )
-        generate_final_model(
-            geo_model=gempy_model, interpolation_input_=test_list, num_layers=num_layers,
-            posterior_data=posterior_minus_t, slope=200, filename='posterior_model_minus_std.png'
-        )
-    except Exception as e:
-        print("generate_final_model skipped or failed:", e)
-
-    print("Done inference run.")
+    # Reconstruct final models at mean and ±std
+    generate_final_model(gempy_model, test_list, num_layers, list_parameter_mean, 200, 'posterior_model.png')
+    generate_final_model(gempy_model, test_list, num_layers, list_parameter_mean_plus_std, 200, 'posterior_model_plus_std.png')
+    generate_final_model(gempy_model, test_list, num_layers, list_parameter_mean_minus_std, 200, 'posterior_model_minus_std.png')
 
 
 if __name__ == "__main__":
-    print("Script started.")
-    start = datetime.now()
+    print("Script started...")
+    start_time = datetime.now()
     main()
-    end = datetime.now()
+    end_time = datetime.now()
     print("Script ended.")
-    print("Elapsed:", end - start)
+    print(f"Elapsed time: {end_time - start_time}")
